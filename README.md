@@ -182,6 +182,14 @@ That's plenty for personal use. If you hit the limit, the bot replies that it's 
 
 ## Tests
 
+Real-model check (uses your `.env` and a throwaway database; prints PASS/FAIL per scenario):
+
+```bash
+python -m app.smoketest
+```
+
+Unit tests:
+
 ```bash
 pytest -q
 ```
