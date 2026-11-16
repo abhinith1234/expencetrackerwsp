@@ -7,7 +7,6 @@ through the Twilio API from a background task.
 
 from __future__ import annotations
 
-import hmac
 import logging
 from contextlib import asynccontextmanager
 
@@ -16,7 +15,6 @@ from twilio.request_validator import RequestValidator
 
 from . import config, db, whatsapp
 from .agent import handle_message
-from .report import send_monthly_reports
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("app")
@@ -79,14 +77,3 @@ async def whatsapp_webhook(
         background.add_task(_reply_in_background, user_id, body)
     return Response(EMPTY_TWIML, media_type="application/xml")
 
-
-@app.post("/cron/monthly-report")
-def monthly_report(
-    background: BackgroundTasks,
-    month: str | None = None,
-    x_cron_secret: str | None = Header(default=None),
-) -> dict:
-    if not config.CRON_SECRET or not x_cron_secret or not hmac.compare_digest(x_cron_secret, config.CRON_SECRET):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    background.add_task(send_monthly_reports, month)
-    return {"queued": True, "month": month or "previous"}

@@ -174,6 +174,21 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        "name": "month_summary",
+        "description": (
+            "Everything needed for a monthly report in one call: totals and category breakdown "
+            "(with % of total), the previous month's totals for comparison, budget status, "
+            "top 5 expenses, daily average and number of expenses. Use for 'summary', "
+            "'report', or 'how did I do in <month>'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"month": {"type": "string", "description": "Month as YYYY-MM."}},
+            "required": ["month"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "set_default_currency",
         "description": "Change the currency used when the user doesn't name one.",
         "input_schema": {
@@ -430,6 +445,63 @@ def budget_status(conn, user_id, month, today: date | None = None) -> dict:
     }
 
 
+def _prev_month(month: str) -> str:
+    start, _ = _month_bounds(month)
+    return (start - timedelta(days=1)).strftime("%Y-%m")
+
+
+def month_summary(conn, user_id, month, today: date | None = None) -> dict:
+    start, end = _month_bounds(month)
+    from . import config
+    today = today or datetime.now(config.TIMEZONE).date()
+    s, e = start.isoformat(), end.isoformat()
+
+    def totals_for(a: str, b: str) -> dict[str, float]:
+        return {r["currency"]: _round(r["t"]) for r in conn.execute(
+            "SELECT currency, SUM(amount) t FROM expenses WHERE user_id = ? AND spent_on BETWEEN ? AND ? "
+            "GROUP BY currency", (user_id, a, b))}
+
+    totals = totals_for(s, e)
+    by_cat = []
+    for r in conn.execute(
+        "SELECT category, currency, SUM(amount) t, COUNT(*) n FROM expenses "
+        "WHERE user_id = ? AND spent_on BETWEEN ? AND ? GROUP BY category, currency ORDER BY t DESC",
+        (user_id, s, e),
+    ):
+        total = totals.get(r["currency"]) or 0
+        by_cat.append({"category": r["category"], "currency": r["currency"], "total": _round(r["t"]),
+                       "count": r["n"], "percent": round(100 * r["t"] / total, 1) if total else None})
+
+    prev = _prev_month(month)
+    p_start, p_end = _month_bounds(prev)
+    prev_totals = totals_for(p_start.isoformat(), p_end.isoformat())
+    prev_by_cat = {f'{r["category"]} ({r["currency"]})': _round(r["t"]) for r in conn.execute(
+        "SELECT category, currency, SUM(amount) t FROM expenses WHERE user_id = ? AND spent_on BETWEEN ? AND ? "
+        "GROUP BY category, currency", (user_id, p_start.isoformat(), p_end.isoformat()))}
+
+    top = [dict(r) for r in conn.execute(
+        "SELECT spent_on AS date, amount, currency, category, description, merchant FROM expenses "
+        "WHERE user_id = ? AND spent_on BETWEEN ? AND ? ORDER BY amount DESC LIMIT 5", (user_id, s, e))]
+    count = conn.execute("SELECT COUNT(*) FROM expenses WHERE user_id = ? AND spent_on BETWEEN ? AND ?",
+                         (user_id, s, e)).fetchone()[0]
+
+    days_elapsed = (min(today, end) - start).days + 1 if today >= start else 0
+    in_progress = start <= today <= end
+    return {
+        "month": month,
+        "month_in_progress": in_progress,
+        "days_elapsed": days_elapsed,
+        "days_in_month": end.day,
+        "expense_count": count,
+        "totals": totals,
+        "daily_average": {c: _round(t / days_elapsed) for c, t in totals.items()} if days_elapsed else {},
+        "by_category": by_cat,
+        "previous_month": {"month": prev, "totals": prev_totals, "by_category": prev_by_cat},
+        "budgets": budget_status(conn, user_id, month, today=today)["budgets"],
+        "top_expenses": top,
+    }
+
+
 def set_default_currency(conn, user_id, currency) -> dict:
     cur = _currency(conn, user_id, currency)
     db.set_default_currency(conn, user_id, cur)
@@ -443,6 +515,7 @@ _IMPLS: dict[str, Callable[..., dict]] = {
     "delete_expense": delete_expense,
     "set_budget": set_budget,
     "budget_status": budget_status,
+    "month_summary": month_summary,
     "set_default_currency": set_default_currency,
 }
 

@@ -115,3 +115,43 @@ def test_split_message():
     parts = split_message(long, limit=500)
     assert all(len(p) <= 500 for p in parts)
     assert "\n".join(parts).replace("\n", "") == long.replace("\n", "")
+
+
+def test_parse_summary_request():
+    from datetime import date
+
+    from app.agent import parse_summary_request as p
+
+    today = date(2026, 11, 16)
+    assert p("summary", today) == "2026-11"
+    assert p("Summary!", today) == "2026-11"
+    assert p("report last month", today) == "2026-10"
+    assert p("summary for october", today) == "2026-10"
+    assert p("summary dec", today) == "2025-12"
+    assert p("report march 2026", today) == "2026-03"
+    assert p("summary of my food spending", today) is None
+    assert p("lunch 250", today) is None
+
+
+def test_summary_command_uses_one_call_with_real_numbers(tmp_db):
+    from datetime import datetime
+
+    from app.tools import run_tool
+
+    month = datetime.now(config.TIMEZONE).strftime("%Y-%m")
+    with db.connect() as conn:
+        run_tool(conn, "u", "add_expenses", {"expenses": [
+            {"amount": 500, "currency": None, "category": "Groceries", "description": "veg",
+             "merchant": None, "payment_method": None, "date": f"{month}-01"}]})
+    fake = FakeClient([reply("📊 *Summary* total ₹500")])
+    out = agent.handle_message("u", "summary", client=fake)
+    assert out == "📊 *Summary* total ₹500"
+    assert len(fake.calls) == 1 and "tools" not in fake.calls[0]
+    data = fake.calls[0]["messages"][-1]["content"]
+    assert '"Groceries"' in data and '"INR": 500.0' in data
+
+
+def test_summary_with_no_expenses_skips_model(tmp_db):
+    fake = FakeClient([])
+    assert "No expenses logged" in agent.handle_message("u", "summary", client=fake)
+    assert fake.calls == []

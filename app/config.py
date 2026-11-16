@@ -44,5 +44,3 @@ TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 VALIDATE_TWILIO_SIGNATURE = _bool("VALIDATE_TWILIO_SIGNATURE", True)
 
-# Shared secret protecting the /cron/monthly-report endpoint.
-CRON_SECRET = os.getenv("CRON_SECRET", "")

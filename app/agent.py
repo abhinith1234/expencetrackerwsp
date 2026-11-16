@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 import openai
 
 from . import config, db
-from .tools import CATEGORIES, TOOL_SCHEMAS, run_tool
+from .tools import CATEGORIES, TOOL_SCHEMAS, month_summary, run_tool
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +32,16 @@ OPENAI_TOOLS = [
     }
     for t in TOOL_SCHEMAS
 ]
+
+REPORT_FORMAT = """REPORT FORMAT (for summaries, WhatsApp style, under ~1200 characters):
+📊 *<Month YYYY> summary* (say "so far" and the day count if the month is still in progress)
+*Total:* amount (+ daily average) and change vs previous month in % if it had spending
+*By category:* "• Category — amount (xx%)" lines, largest first, max 8 lines
+*Budgets:* one line per budget with spent/limit and ✅ / ⚠️ (over 80%) / 🔴 (over 100%) — omit if none
+*Top expenses:* the 3 biggest, "• description — amount (date)"
+💡 *Tips:* 2-3 short, specific suggestions based on these exact numbers (e.g. which category grew,
+how much to cut per week to stay in budget). No generic advice.
+Use only numbers present in the data. Never invent figures."""
 
 SYSTEM_PROMPT = f"""You are a friendly personal expense-tracking assistant that lives in WhatsApp.
 The user texts you their spending in casual language and asks questions about their money.
@@ -51,11 +61,8 @@ What you do:
 3. Corrections: "undo", "delete that", "that was 300 not 200", "move it to groceries" -> use
    delete_expense / update_expense. Use query_expenses to find the id when needed.
 4. Budgets: "set food budget 8000", "monthly budget 50k" -> set_budget (category 'total' for overall).
-5. Reports: when asked for a monthly report, call query_expenses for that month with
-   group_by "category", query the previous month the same way, call budget_status, and query the
-   month's items. Then write: total spent, category breakdown (largest first, with % of total),
-   change vs last month, budget performance, the top 3 expenses, and 2-3 specific saving tips
-   based on the data.
+5. Reports: when asked for a summary/report of a month, call month_summary once and write the
+   report from it (format described below in REPORT FORMAT).
 6. Budgeting advice: give concrete, numbers-based suggestions grounded in their real data.
 
 Categories (use exactly these names): {", ".join(CATEGORIES)}.
@@ -69,7 +76,21 @@ Reply style (this is WhatsApp, not a web page):
   No markdown headings (#), no tables, no links, no **double asterisks**.
 - Use currency symbols when obvious (₹, $, €, £) and thousands separators.
 - If the message is not about money (greetings etc.), reply briefly and say what you can do.
+
+{{REPORT_FORMAT}}
 """
+
+SYSTEM_PROMPT = SYSTEM_PROMPT.replace("{REPORT_FORMAT}", REPORT_FORMAT)
+
+_MONTHS = {m.lower(): i for i, m in enumerate(
+    ["january", "february", "march", "april", "may", "june", "july", "august",
+     "september", "october", "november", "december"], start=1)}
+_MONTHS.update({k[:3]: v for k, v in list(_MONTHS.items())})
+_SUMMARY_RE = re.compile(
+    r"^\s*(?:summary|report|monthly report|month summary)"
+    r"(?:\s+(?:for\s+)?(this month|last month|previous month|[a-z]+)(?:\s+(\d{4}))?)?\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
@@ -95,6 +116,67 @@ def _clean_reply(text: str | None) -> str:
     return text
 
 
+def _complete(client: openai.OpenAI, messages: list[dict], tools: list[dict] | None = None):
+    """One chat completion. Returns (response, None) or (None, friendly_error_text)."""
+    kwargs: dict = {}
+    if tools:
+        kwargs.update(tools=tools, tool_choice="auto")
+    if config.LLM_REASONING_EFFORT:
+        kwargs["reasoning_effort"] = config.LLM_REASONING_EFFORT
+    try:
+        return client.chat.completions.create(
+            model=config.LLM_MODEL,
+            messages=messages,
+            temperature=config.LLM_TEMPERATURE,
+            max_tokens=4096,
+            **kwargs,
+        ), None
+    except openai.RateLimitError:
+        log.warning("Rate limited by LLM provider")
+        return None, "⏳ I've hit my free usage limit for the moment — please try again in a minute."
+    except openai.APIStatusError as e:
+        log.error("LLM API error %s: %s", e.status_code, e.message)
+        return None, "⚠️ Sorry, something went wrong on my side. Please try again."
+    except openai.APIConnectionError:
+        log.exception("Could not reach LLM at %s", config.LLM_BASE_URL)
+        return None, "⚠️ I couldn't reach my brain just now. Please try again shortly."
+
+
+def parse_summary_request(text: str, today) -> str | None:
+    """'summary' -> this month, 'summary last month', 'report october 2026' -> 'YYYY-MM'. Else None."""
+    m = _SUMMARY_RE.match(text or "")
+    if not m:
+        return None
+    which, year = (m.group(1) or "this month").lower(), m.group(2)
+    if which == "this month":
+        return today.strftime("%Y-%m")
+    if which in {"last month", "previous month"}:
+        return (today.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    month_no = _MONTHS.get(which)
+    if month_no is None:
+        return None
+    y = int(year) if year else (today.year if month_no <= today.month else today.year - 1)
+    return f"{y:04d}-{month_no:02d}"
+
+
+def _summary_reply(client: openai.OpenAI, conn, user_id: str, month: str) -> str:
+    """Fast path: gather the numbers in Python, then one model call to write the report."""
+    data = month_summary(conn, user_id, month)
+    pretty = datetime.strptime(month, "%Y-%m").strftime("%B %Y")
+    if not data["expense_count"]:
+        return f"📭 No expenses logged for {pretty} yet. Send one like *lunch 250* to get started."
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": (
+            f"{_context_line(conn, user_id)}\nWrite my {pretty} summary using REPORT FORMAT, "
+            f"based only on this data:\n{json.dumps(data, default=str)}")},
+    ]
+    response, error = _complete(client, messages)
+    if error:
+        return error
+    return _clean_reply(response.choices[0].message.content) or "Couldn't build the summary, please try again."
+
+
 def handle_message(user_id: str, text: str, client: openai.OpenAI | None = None) -> str:
     """Process one incoming message from `user_id` and return the reply text."""
     client = client or _client()
@@ -108,6 +190,13 @@ def handle_message(user_id: str, text: str, client: openai.OpenAI | None = None)
         if text.lower() in {"/reset", "reset chat"}:
             db.clear_history(conn, user_id)
             return "🧹 Chat memory cleared. Your expenses are untouched."
+
+        month = parse_summary_request(text, datetime.now(config.TIMEZONE).date())
+        if month:
+            reply = _summary_reply(client, conn, user_id, month)
+            db.add_history(conn, user_id, "user", text)
+            db.add_history(conn, user_id, "assistant", reply)
+            return reply
 
         messages: list[dict] = db.recent_history(conn, user_id, config.HISTORY_TURNS)
         user_turn = f"{_context_line(conn, user_id)}\n{text}"
@@ -125,30 +214,11 @@ def handle_message(user_id: str, text: str, client: openai.OpenAI | None = None)
 
 def _run_agent(client: openai.OpenAI, conn, user_id: str, messages: list[dict]) -> str:
     convo = [{"role": "system", "content": SYSTEM_PROMPT}, *messages]
-    extra = {}
-    if config.LLM_REASONING_EFFORT:
-        extra["reasoning_effort"] = config.LLM_REASONING_EFFORT
 
     for _ in range(MAX_TOOL_ROUNDS):
-        try:
-            response = client.chat.completions.create(
-                model=config.LLM_MODEL,
-                messages=convo,
-                tools=OPENAI_TOOLS,
-                tool_choice="auto",
-                temperature=config.LLM_TEMPERATURE,
-                max_tokens=4096,
-                **extra,
-            )
-        except openai.RateLimitError:
-            log.warning("Rate limited by LLM provider")
-            return "⏳ I've hit my free usage limit for the moment — please try again in a minute."
-        except openai.APIStatusError as e:
-            log.error("LLM API error %s: %s", e.status_code, e.message)
-            return "⚠️ Sorry, something went wrong on my side. Please try again."
-        except openai.APIConnectionError:
-            log.exception("Could not reach LLM at %s", config.LLM_BASE_URL)
-            return "⚠️ I couldn't reach my brain just now. Please try again shortly."
+        response, error = _complete(client, convo, tools=OPENAI_TOOLS)
+        if error:
+            return error
 
         choice = response.choices[0]
         msg = choice.message

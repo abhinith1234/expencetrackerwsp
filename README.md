@@ -2,7 +2,7 @@
 
 A WhatsApp bot you text your daily spending to. It understands casual messages, sorts
 each expense into a category, tracks budgets, answers questions about your spending, and
-sends you a report at the end of every month.
+gives you a monthly summary whenever you type *summary*.
 
 Built with **Python + FastAPI**, **Twilio WhatsApp**, a **free open-source LLM**, and **SQLite**.
 The model can come from any OpenAI-compatible API that supports tool calling:
@@ -24,7 +24,8 @@ The model can come from any OpenAI-compatible API that supports tool calling:
 | `how much did I spend on food this month?` | Looks it up and answers |
 | `swiggy vs zomato last 3 months` / `biggest expenses this week` | Any question about your data |
 | `am I over budget?` | Budget vs spent, with days left |
-| `report for October` | Full monthly report with tips |
+| `summary` | This month's report so far, with tips |
+| `summary last month` / `summary october` | Report for that month |
 | `make my default currency USD` | Changes the currency used when you don't name one |
 | `/reset` | Clears the bot's short chat memory (expenses are kept) |
 
@@ -51,8 +52,7 @@ WhatsApp ──► Twilio ──► POST /whatsapp (FastAPI)
 - `app/agent.py` – system prompt and the tool-calling loop (OpenAI-compatible API).
 - `app/tools.py` – the tools the model can call, each locked to the sender's phone number.
 - `app/db.py` – SQLite tables for expenses, budgets, users, and short chat history.
-- `app/main.py` – the Twilio webhook (checks Twilio's signature) and the monthly-report endpoint.
-- `app/report.py` – sends each user last month's report.
+- `app/main.py` – the Twilio webhook (checks Twilio's signature).
 - `app/cli.py` – chat with the bot in your terminal, no WhatsApp needed.
 
 The model never computes totals itself. Every number comes from SQL lookups on your stored expenses.
@@ -140,31 +140,15 @@ In the Twilio sandbox settings, set **"When a message comes in"** to
 
 Now send `lunch 250` on WhatsApp. 🎉
 
-### 5. Monthly report
+### 5. Monthly summary
 
-Run this on the 1st of every month. It sends each user the previous month's report:
+There's no scheduled job. Type **`summary`** on WhatsApp any time and the bot replies with:
+the month's total and daily average, a category breakdown, the change from last month, your budgets,
+your biggest expenses, and a few saving tips.
+Try `summary last month` or `summary october` for other months.
 
-```bash
-python -m app.report
-```
-
-For example, with cron at 9:05 AM on the 1st:
-
-```
-5 9 1 * * cd /path/to/expencetrackerwsp && .venv/bin/python -m app.report
-```
-
-If you host the bot somewhere without cron, use any scheduler (GitHub Actions, cron-job.org, Render cron)
-to call:
-
-```bash
-curl -X POST https://your-host/cron/monthly-report -H "X-Cron-Secret: $CRON_SECRET"
-```
-
-> **WhatsApp's 24-hour rule:** WhatsApp only lets a business send free-form messages within 24 hours
-> of your last message. If you text the bot daily, the report always arrives. If you go quiet, it won't
-> be delivered until you set up an approved message template on a production WhatsApp sender. You can
-> always just ask: *"report for this month"*.
+The numbers are calculated in Python straight from the database. The model only writes them up and adds
+tips, so a summary takes a single quick model call.
 
 ## Deploying
 
@@ -193,7 +177,7 @@ from `.env.example` in the host's environment settings. Point the Twilio webhook
 | `ALLOWED_NUMBERS` | *(empty = anyone)* | Comma-separated `whatsapp:+…` numbers |
 
 **Free-tier limits:** Groq's free tier allows about 1,000 requests a day. One message usually takes
-2–3 requests (the model looks something up, then replies), and a monthly report takes about 5.
+2–3 requests (the model looks something up, then replies), and a `summary` takes 1.
 That's plenty for personal use. If you hit the limit, the bot replies that it's busy.
 
 ## Tests

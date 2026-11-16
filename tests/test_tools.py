@@ -108,3 +108,23 @@ def test_tolerates_sloppy_model_arguments(tmp_db):
         assert saved["amount"] == 1200 and saved["currency"] == "INR"
         out, err = run_tool(conn, "u1", "set_budget", {"category": "total", "amount": "50000"})
         assert not err, out
+
+
+def test_month_summary(tmp_db):
+    from app.tools import month_summary
+
+    with db.connect() as conn:
+        call(conn, "set_budget", category="Food & Dining", amount=1000, currency=None)
+        call(conn, "add_expenses", expenses=[
+            exp(300, "Food & Dining", "2026-11-02", desc="dinner"),
+            exp(100, "Transport", "2026-11-03"),
+            exp(200, "Food & Dining", "2026-10-15"),
+        ])
+        s = month_summary(conn, "u1", "2026-11", today=date(2026, 11, 10))
+    assert s["totals"] == {"INR": 400.0}
+    assert s["by_category"][0] == {"category": "Food & Dining", "currency": "INR", "total": 300.0,
+                                   "count": 1, "percent": 75.0}
+    assert s["previous_month"]["totals"] == {"INR": 200.0}
+    assert s["daily_average"] == {"INR": 40.0}
+    assert s["top_expenses"][0]["description"] == "dinner"
+    assert s["budgets"][0]["spent"] == 300.0
