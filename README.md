@@ -4,7 +4,12 @@ A WhatsApp bot you text your daily spending to. It understands casual messages, 
 each expense into a category, tracks budgets, answers questions about your spending, and
 sends you a report at the end of every month.
 
-Built with **Python + FastAPI**, **Twilio WhatsApp**, **Claude** (Anthropic API), and **SQLite**.
+Built with **Python + FastAPI**, **Twilio WhatsApp**, a **free open-source LLM**, and **SQLite**.
+The model can come from any OpenAI-compatible API that supports tool calling:
+
+- **Groq free tier** (default): open models like `openai/gpt-oss-120b` and Qwen run in the cloud.
+  Signing up is free, there's no credit card, and you get about 1,000 requests a day.
+- **Ollama**: runs open models like Qwen on your own computer. Completely free and offline.
 
 ## What you can send it
 
@@ -35,7 +40,7 @@ WhatsApp ──► Twilio ──► POST /whatsapp (FastAPI)
                           ▼
                     background task
                           │
-                  Claude (claude-opus-5-5) ◄──► tools ──► SQLite
+              Open-source LLM (Groq/Ollama) ◄──► tools ──► SQLite
                   add_expenses · query_expenses · update_expense
                   delete_expense · set_budget · budget_status
                           │
@@ -43,14 +48,14 @@ WhatsApp ──► Twilio ──► POST /whatsapp (FastAPI)
                Twilio API ──► reply on WhatsApp
 ```
 
-- `app/agent.py` – system prompt and the Claude tool-use loop.
-- `app/tools.py` – the tools Claude can call, each locked to the sender's phone number.
+- `app/agent.py` – system prompt and the tool-calling loop (OpenAI-compatible API).
+- `app/tools.py` – the tools the model can call, each locked to the sender's phone number.
 - `app/db.py` – SQLite tables for expenses, budgets, users, and short chat history.
 - `app/main.py` – the Twilio webhook (checks Twilio's signature) and the monthly-report endpoint.
 - `app/report.py` – sends each user last month's report.
 - `app/cli.py` – chat with the bot in your terminal, no WhatsApp needed.
 
-Claude never makes up numbers. Every answer comes from SQL lookups on your stored expenses.
+The model never computes totals itself. Every number comes from SQL lookups on your stored expenses.
 
 ## Setup
 
@@ -72,9 +77,36 @@ pip install -r requirements-dev.txt
 cp .env.example .env
 ```
 
-### 2. Get a Claude API key
+### 2. Pick a free model
 
-Create a key at <https://platform.claude.com> and put it in `.env` as `ANTHROPIC_API_KEY`.
+**Option A: Groq (recommended, nothing to install)**
+
+1. Sign up at <https://console.groq.com> and create an API key under **API Keys**. It's free.
+2. In `.env`, set `LLM_API_KEY=gsk_...`. The default `LLM_BASE_URL` and `LLM_MODEL` already point to
+   Groq's free `openai/gpt-oss-120b`.
+3. Groq changes its free model list from time to time. If you get a "model not found" error, pick
+   another model with tool support from <https://console.groq.com/docs/models>
+   (e.g. `openai/gpt-oss-20b` or a Qwen model) and set `LLM_MODEL` to it.
+
+**Option B: Ollama (runs on your own computer)**
+
+1. Install from <https://ollama.com>, then pull a model that supports tool calling:
+
+```bash
+ollama pull qwen3:8b
+```
+
+2. In `.env`, set:
+
+```
+LLM_BASE_URL=http://localhost:11434/v1
+LLM_API_KEY=
+LLM_MODEL=qwen3:8b
+LLM_REASONING_EFFORT=
+```
+
+The bot only works while that computer is on. Use a model of 7B parameters or more:
+smaller models get categories and dates wrong more often. 8 GB of RAM is enough for `qwen3:8b`.
 
 Try the bot in your terminal before setting up WhatsApp:
 
@@ -150,16 +182,19 @@ from `.env.example` in the host's environment settings. Point the Twilio webhook
 
 | Variable | Default | Notes |
 |---|---|---|
-| `CLAUDE_MODEL` | `claude-opus-5-5` | Model used for understanding and answering |
-| `CLAUDE_EFFORT` | `medium` | `low` is faster and cheaper; `high` thinks harder on tricky questions |
+| `LLM_BASE_URL` | Groq | Any OpenAI-compatible endpoint (Groq, Ollama, OpenRouter, LM Studio) |
+| `LLM_API_KEY` | – | Free Groq key; leave empty for Ollama |
+| `LLM_MODEL` | `openai/gpt-oss-120b` | Must support tool/function calling |
+| `LLM_REASONING_EFFORT` | *(unset)* | `low`/`medium`/`high` for reasoning models like gpt-oss |
+| `LLM_TEMPERATURE` | `0.2` | Keep low so categories stay consistent |
 | `DEFAULT_CURRENCY` | `INR` | Used when you don't name a currency. Each user can change their own |
 | `TIMEZONE` | `Asia/Kolkata` | Decides what "today" and "yesterday" mean |
 | `HISTORY_TURNS` | `6` | How many past exchanges the bot remembers (for "change that to 300") |
 | `ALLOWED_NUMBERS` | *(empty = anyone)* | Comma-separated `whatsapp:+…` numbers |
 
-If Claude's safety filter turns down a message, the request is retried on a fallback model chosen
-by Anthropic (`fallbacks: "default"`). To turn this off, delete the `betas` and `fallbacks` lines
-in `app/agent.py`.
+**Free-tier limits:** Groq's free tier allows about 1,000 requests a day. One message usually takes
+2–3 requests (the model looks something up, then replies), and a monthly report takes about 5.
+That's plenty for personal use. If you hit the limit, the bot replies that it's busy.
 
 ## Tests
 
@@ -167,4 +202,4 @@ in `app/agent.py`.
 pytest -q
 ```
 
-The tests use a fake Claude client, so they need no API key and cost nothing.
+The tests use a fake LLM client, so they need no API key or model.

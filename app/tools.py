@@ -1,12 +1,13 @@
-"""Tools Claude can call to read and write the user's expenses.
+"""Tools the LLM can call to read and write the user's expenses.
 
-Each tool has a JSON schema (sent to Claude) and a Python implementation.
+Each tool has a JSON schema (sent to the model) and a Python implementation.
 All implementations are scoped to a single user_id, so one user can never
 see or change another user's data no matter what the model asks for.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 import sqlite3
@@ -61,7 +62,6 @@ TOOL_SCHEMAS: list[dict] = [
             "reports spending, even casually (e.g. 'chai 20', 'uber 250 and lunch 400'). "
             "One entry per distinct purchase. Pick the single best category."
         ),
-        "strict": True,
         "input_schema": {
             "type": "object",
             "properties": {
@@ -95,7 +95,6 @@ TOOL_SCHEMAS: list[dict] = [
             "Returns totals per currency, group totals, and the matching items (newest first, "
             "with their ids). Use this to answer any question about past spending."
         ),
-        "strict": True,
         "input_schema": {
             "type": "object",
             "properties": {
@@ -116,7 +115,6 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "name": "update_expense",
         "description": "Correct an existing expense by id. Pass null for fields that should not change.",
-        "strict": True,
         "input_schema": {
             "type": "object",
             "properties": {
@@ -141,7 +139,6 @@ TOOL_SCHEMAS: list[dict] = [
             "Delete an expense. Pass its id, or null to delete the most recently added expense "
             "(for 'undo' / 'delete that')."
         ),
-        "strict": True,
         "input_schema": {
             "type": "object",
             "properties": {"expense_id": {"type": ["integer", "null"]}},
@@ -155,7 +152,6 @@ TOOL_SCHEMAS: list[dict] = [
             "Set a monthly budget for a category, or for 'total' overall spending. "
             "An amount of 0 removes the budget."
         ),
-        "strict": True,
         "input_schema": {
             "type": "object",
             "properties": {
@@ -170,7 +166,6 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "name": "budget_status",
         "description": "Show each budget for a month next to what has been spent so far, and how many days are left.",
-        "strict": True,
         "input_schema": {
             "type": "object",
             "properties": {"month": {"type": "string", "description": "Month as YYYY-MM."}},
@@ -181,7 +176,6 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "name": "set_default_currency",
         "description": "Change the currency used when the user doesn't name one.",
-        "strict": True,
         "input_schema": {
             "type": "object",
             "properties": {"currency": {"type": "string", "description": "ISO 4217 code, e.g. INR, USD."}},
@@ -193,7 +187,7 @@ TOOL_SCHEMAS: list[dict] = [
 
 
 class ToolError(Exception):
-    """An error message that should be shown to Claude so it can fix its call."""
+    """An error message shown to the model so it can fix its call."""
 
 
 # ---------- helpers ----------
@@ -261,7 +255,7 @@ def add_expenses(conn, user_id, expenses: list[dict]) -> dict:
         created.append({"id": cur.lastrowid, "amount": row[1], "currency": row[2], "category": row[3],
                         "description": row[4], "date": row[7]})
 
-    # Month-to-date totals for the touched categories, so Claude can warn about budgets.
+    # Month-to-date totals for the touched categories, so the model can warn about budgets.
     month_info = []
     for month in sorted({c["date"][:7] for c in created}):
         status = budget_status(conn, user_id, month)
@@ -453,13 +447,42 @@ _IMPLS: dict[str, Callable[..., dict]] = {
 }
 
 
+_NUMERIC = {"amount", "expense_id", "limit"}
+
+
+def _coerce(value: Any) -> Any:
+    """Turn '250', '1,200' or '₹80' into numbers - smaller models often quote them."""
+    if isinstance(value, str):
+        cleaned = re.sub(r"[^\d.\-]", "", value)
+        if cleaned and re.fullmatch(r"-?\d+(\.\d+)?", cleaned):
+            return float(cleaned) if "." in cleaned else int(cleaned)
+    return value
+
+
+def _normalise(tool_input: dict, allowed: set[str]) -> dict:
+    out = {}
+    for key, value in tool_input.items():
+        if key not in allowed:
+            continue  # ignore extra arguments the model invented
+        if value in ("", "null", "None"):
+            value = None
+        if key in _NUMERIC and value is not None:
+            value = _coerce(value)
+        if key == "expenses" and isinstance(value, list):
+            value = [{k: (_coerce(v) if k == "amount" else (None if v in ("", "null") else v))
+                      for k, v in item.items()} for item in value if isinstance(item, dict)]
+        out[key] = value
+    return out
+
+
 def run_tool(conn: sqlite3.Connection, user_id: str, name: str, tool_input: dict) -> tuple[str, bool]:
     """Run a tool for this user. Returns (json_result, is_error)."""
     impl = _IMPLS.get(name)
     if impl is None:
         return json.dumps({"error": f"unknown tool {name}"}), True
+    params = set(inspect.signature(impl).parameters) - {"conn", "user_id"}
     try:
-        result = impl(conn, user_id, **tool_input)
+        result = impl(conn, user_id, **_normalise(tool_input, params))
         return json.dumps(result, default=str), False
     except ToolError as e:
         return json.dumps({"error": str(e)}), True

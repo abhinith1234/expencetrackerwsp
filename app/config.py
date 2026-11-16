@@ -15,10 +15,15 @@ def _bool(name: str, default: bool) -> bool:
     return val.strip().lower() in {"1", "true", "yes", "on"}
 
 
-# --- Claude ---
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-5-5")
-# low | medium | high | xhigh | max. "medium" is a good balance for logging + Q&A.
-CLAUDE_EFFORT = os.getenv("CLAUDE_EFFORT", "medium")
+# --- LLM (any OpenAI-compatible endpoint: Groq, Ollama, OpenRouter, LM Studio...) ---
+# Groq free tier (default):  https://api.groq.com/openai/v1   + free key from console.groq.com
+# Ollama on your computer:   http://localhost:11434/v1          (no key needed)
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "") or "not-needed"
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
+# Optional: low | medium | high for reasoning models such as gpt-oss. Empty = don't send it.
+LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "").strip()
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
 
 # --- App ---
 DB_PATH = os.getenv("DB_PATH", "expenses.db")

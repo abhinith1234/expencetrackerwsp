@@ -91,9 +91,20 @@ def test_default_currency(tmp_db):
         assert res["saved"][0]["currency"] == "USD"
 
 
-def test_schemas_are_strict():
+def test_schemas_are_well_formed():
     for t in TOOL_SCHEMAS:
         schema = t["input_schema"]
-        assert t["strict"] is True
         assert schema["additionalProperties"] is False
         assert set(schema["required"]) == set(schema["properties"])
+
+
+def test_tolerates_sloppy_model_arguments(tmp_db):
+    with db.connect() as conn:
+        out, err = run_tool(conn, "u1", "add_expenses", {"expenses": [
+            {"amount": "₹1,200", "category": "Groceries", "description": "veg", "date": "2026-11-02",
+             "currency": "", "merchant": "null"}], "made_up_arg": 1})
+        assert not err, out
+        saved = json.loads(out)["saved"][0]
+        assert saved["amount"] == 1200 and saved["currency"] == "INR"
+        out, err = run_tool(conn, "u1", "set_budget", {"category": "total", "amount": "50000"})
+        assert not err, out

@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+os.environ.setdefault("LLM_API_KEY", "test-key")
 
 
 @pytest.fixture()

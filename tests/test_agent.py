@@ -1,50 +1,55 @@
-"""Agent loop tests with a fake Claude client (no API calls)."""
+"""Agent loop tests with a fake LLM client (no API calls)."""
 
+import json
 from types import SimpleNamespace as NS
+
+import httpx
+import openai
 
 from fastapi.testclient import TestClient
 
 from app import agent, config, db
 
 
-def text(t):
-    return NS(type="text", text=t)
+def reply(content=None, tool_calls=None, finish="stop"):
+    msg = NS(content=content, tool_calls=tool_calls)
+    return NS(choices=[NS(message=msg, finish_reason=finish)])
 
 
-def tool_use(id_, name, inp):
-    return NS(type="tool_use", id=id_, name=name, input=inp)
+def call(id_, name, args):
+    return NS(id=id_, type="function", function=NS(name=name, arguments=json.dumps(args)))
 
 
 class FakeClient:
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = []
-        self.beta = NS(messages=NS(create=self._create))
+        self.chat = NS(completions=NS(create=self._create))
 
     def _create(self, **kwargs):
         self.calls.append({**kwargs, "messages": list(kwargs["messages"])})
-        return self.responses.pop(0)
+        r = self.responses.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
 
 
 def test_logs_expense_via_tool_then_replies(tmp_db):
     fake = FakeClient([
-        NS(stop_reason="tool_use", content=[
-            NS(type="thinking", thinking="", signature="s"),
-            tool_use("t1", "add_expenses", {"expenses": [{
-                "amount": 60, "currency": None, "category": "Food & Dining", "description": "Dosa",
-                "merchant": None, "payment_method": "cash", "date": "2026-11-16"}]}),
-        ]),
-        NS(stop_reason="end_turn", content=[text("✅ Logged ₹60 Food & Dining (Dosa)")]),
+        reply(tool_calls=[call("t1", "add_expenses", {"expenses": [{
+            "amount": "60", "currency": None, "category": "Food & Dining", "description": "Dosa",
+            "merchant": None, "payment_method": "cash", "date": "2026-11-16"}]})], finish="tool_calls"),
+        reply("<think>easy</think>✅ **Logged** ₹60 Food & Dining (Dosa)"),
     ])
-    reply = agent.handle_message("whatsapp:+911", "dosa 60 cash", client=fake)
-    assert reply == "✅ Logged ₹60 Food & Dining (Dosa)"
+    out = agent.handle_message("whatsapp:+911", "dosa 60 cash", client=fake)
+    assert out == "✅ *Logged* ₹60 Food & Dining (Dosa)"
 
-    # Second request carried the tool result back, matched by id.
     second = fake.calls[1]["messages"]
-    assert second[-1]["content"][0]["tool_use_id"] == "t1"
-    assert second[-1]["content"][0]["is_error"] is False
-    assert fake.calls[0]["fallbacks"] == "default"
-    assert fake.calls[0]["tools"][0]["name"] == "add_expenses"
+    assert second[0]["role"] == "system"
+    assert second[-2]["tool_calls"][0]["id"] == "t1"
+    assert second[-1]["role"] == "tool" and second[-1]["tool_call_id"] == "t1"
+    assert "error" not in json.loads(second[-1]["content"])
+    assert fake.calls[0]["tools"][0]["function"]["name"] == "add_expenses"
 
     with db.connect() as conn:
         row = conn.execute("SELECT amount, currency, payment_method FROM expenses").fetchone()
@@ -53,20 +58,28 @@ def test_logs_expense_via_tool_then_replies(tmp_db):
     assert [h["role"] for h in hist] == ["user", "assistant"]
 
 
+def test_bad_tool_json_is_reported_back(tmp_db):
+    bad = NS(id="t1", type="function", function=NS(name="add_expenses", arguments="{not json"))
+    fake = FakeClient([reply(tool_calls=[bad]), reply("sorry, fixed")])
+    assert agent.handle_message("u", "x 5", client=fake) == "sorry, fixed"
+    assert "invalid JSON" in fake.calls[1]["messages"][-1]["content"]
+
+
 def test_history_is_sent_on_next_message(tmp_db):
-    fake = FakeClient([NS(stop_reason="end_turn", content=[text("hi!")]),
-                       NS(stop_reason="end_turn", content=[text("ok")])])
+    fake = FakeClient([reply("hi!"), reply("ok")])
     agent.handle_message("u", "hello", client=fake)
     agent.handle_message("u", "and again", client=fake)
     msgs = fake.calls[1]["messages"]
-    assert msgs[0] == {"role": "user", "content": "hello"}
-    assert msgs[1] == {"role": "assistant", "content": "hi!"}
-    assert msgs[2]["content"].endswith("and again") and "[Context: today is" in msgs[2]["content"]
+    assert msgs[1] == {"role": "user", "content": "hello"}
+    assert msgs[2] == {"role": "assistant", "content": "hi!"}
+    assert msgs[3]["content"].endswith("and again") and "[Context: today is" in msgs[3]["content"]
 
 
-def test_refusal_is_handled(tmp_db):
-    fake = FakeClient([NS(stop_reason="refusal", content=[])])
-    assert "can't help" in agent.handle_message("u", "something odd", client=fake)
+def test_rate_limit_is_friendly(tmp_db):
+    req = httpx.Request("POST", "http://x")
+    err = openai.RateLimitError("slow down", response=httpx.Response(429, request=req), body=None)
+    fake = FakeClient([err])
+    assert "limit" in agent.handle_message("u", "tea 10", client=fake)
 
 
 def test_webhook_acknowledges_and_replies_in_background(tmp_db, monkeypatch):

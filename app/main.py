@@ -1,6 +1,6 @@
 """FastAPI web server that receives WhatsApp messages from Twilio.
 
-Twilio gives a webhook ~15 seconds to answer, and Claude may take longer when it
+Twilio gives a webhook ~15 seconds to answer, and the LLM may take longer when it
 runs several lookups, so we acknowledge immediately and send the real reply
 through the Twilio API from a background task.
 """
